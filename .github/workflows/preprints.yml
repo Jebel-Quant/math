@@ -1,0 +1,156 @@
+# Compile every preprint whose LaTeX source has changed since it was last built.
+#
+# Each preprint lives in preprints/<name>/source/.  Its compiled PDF is
+# published as the single asset of a GitHub release tagged preprint-<name>,
+# and the release notes record the git tree hash of the source folder it was
+# built from.  A preprint is compiled when
+#
+#   - it has never been compiled (there is no release yet), or
+#   - the tree hash of its source folder differs from the recorded one.
+#
+# The tree hash covers every tracked file under source/, so any change to the
+# LaTeX, the code that generates figures and tables, or the Makefile triggers
+# a rebuild, and nothing else does.  Source folders without a top-level .tex
+# file containing \documentclass are skipped.
+#
+# On pull requests the changed preprints are compiled to check that they
+# still build, and the PDFs are attached to the run, but nothing is released.
+
+name: Preprints
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "preprints/**"
+      - ".github/workflows/preprints.yml"
+  pull_request:
+    paths:
+      - "preprints/**"
+      - ".github/workflows/preprints.yml"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Compile every preprint, changed or not"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: preprints-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Find preprints to compile
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.scan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare source trees with the last release
+        id: scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          entries=()
+          for dir in preprints/*/source; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$(dirname "$dir")")
+
+            main=$(grep -lE '^[[:space:]]*\\documentclass' "$dir"/*.tex 2>/dev/null | head -n 1 || true)
+            if [ -z "$main" ]; then
+              echo "::notice::$name: no LaTeX document in $dir, skipping"
+              continue
+            fi
+            main=$(basename "$main" .tex)
+
+            tree=$(git rev-parse "HEAD:$dir")
+            built=$(gh release view "preprint-$name" --json body --jq .body 2>/dev/null \
+                      | sed -nE 's/^source-tree: ([0-9a-f]+).*/\1/p' || true)
+
+            if [ "$FORCE" = "true" ]; then
+              reason="forced"
+            elif [ -z "$built" ]; then
+              reason="never compiled"
+            elif [ "$built" != "$tree" ]; then
+              reason="source changed ($built -> $tree)"
+            else
+              echo "$name: up to date ($tree)"
+              continue
+            fi
+            echo "$name: $reason"
+            entries+=("$(jq -cn --arg name "$name" --arg main "$main" --arg tree "$tree" \
+                           '{name: $name, main: $main, tree: $tree}')")
+          done
+          matrix=$(printf '%s\n' ${entries[@]+"${entries[@]}"} | jq -cs .)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Preprints to compile: $matrix"
+
+  compile:
+    name: Compile ${{ matrix.preprint.name }}
+    needs: detect
+    if: needs.detect.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preprint: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    env:
+      NAME: ${{ matrix.preprint.name }}
+      MAIN: ${{ matrix.preprint.main }}
+      TREE: ${{ matrix.preprint.tree }}
+      SRC: preprints/${{ matrix.preprint.name }}/source
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install TeX Live
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-latex-base texlive-latex-recommended texlive-latex-extra \
+            texlive-fonts-recommended lmodern latexmk
+
+      # Preprints with a Makefile may generate figures and tables in Python.
+      - name: Install uv
+        if: hashFiles(format('{0}/Makefile', env.SRC)) != ''
+        uses: astral-sh/setup-uv@v6
+
+      - name: Compile
+        working-directory: ${{ env.SRC }}
+        run: |
+          if [ -f Makefile ]; then
+            make compile
+          else
+            latexmk -pdf -interaction=nonstopmode -halt-on-error -file-line-error "$MAIN.tex"
+          fi
+          test -f "$MAIN.pdf"
+          cp "$MAIN.pdf" "$GITHUB_WORKSPACE/$NAME.pdf"
+
+      - name: Attach PDF to the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.pdf
+          if-no-files-found: error
+
+      # Releases cannot move their tag, so the old release is replaced.
+      - name: Publish release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="preprint-$NAME"
+          gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$tag" "$NAME.pdf" \
+            --target "$GITHUB_SHA" \
+            --title "$NAME" \
+            --latest=false \
+            --notes "Compiled from \`$SRC\` at $GITHUB_SHA.
+
+          source-tree: $TREE"
