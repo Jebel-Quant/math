@@ -1,0 +1,28 @@
+# Everything below is produced by `make` from digit50.tex and code/*.py.
+
+# The built paper
+digit50.pdf
+
+# The arXiv submission and its staging directory
+digit50-arxiv.zip
+.arxiv/
+
+# pdfLaTeX intermediates
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.bbl
+*.blg
+*.fls
+*.synctex.gz
+
+# Written by code/paper.py
+# figs/
+# snippets/
+.assets.stamp
+
+# Python
+__pycache__/
